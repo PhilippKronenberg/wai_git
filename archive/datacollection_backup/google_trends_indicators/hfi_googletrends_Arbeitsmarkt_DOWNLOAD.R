@@ -67,8 +67,9 @@ safe_proc_keyword_latest <- function(keyword, geo = "CH", fallback_to_cache = TR
     return(TRUE)
   }, error = function(e) {
     err_msg <- as.character(e)
-    if (grepl("429|rate limit|too soon", err_msg, ignore.case = TRUE)) {
-      message(sprintf("  RATE LIMITED (429): %s", keyword))
+    if (grepl("429|rate limit|too soon", err_msg, ignore.case = TRUE) ||
+        grepl("No data returned by the query|No data returned", err_msg, ignore.case = TRUE)) {
+      message(sprintf("  RATE LIMITED/NO DATA: %s", keyword))
       message("     -> Use cached data instead")
       if (fallback_to_cache) {
         return(FALSE)  # signal that we used cache
