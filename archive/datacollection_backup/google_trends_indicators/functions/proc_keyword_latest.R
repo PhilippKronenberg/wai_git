@@ -63,6 +63,38 @@ proc_keyword_latest <- function(keyword = "Insolvenz",
     write_keyword(aggregate_averages(old, new), keyword, geo, suffix)
   }
 
+  find_next_missing <- function(existing, by, default_from) {
+    if (is.null(existing) || nrow(existing) == 0) {
+      return(as.Date(default_from))
+    }
+    if (!"time" %in% names(existing)) {
+      return(as.Date(default_from))
+    }
+    existing <- existing %>% mutate(time = as.Date(time))
+    existing <- existing[order(existing$time), ]
+    existing <- existing[!duplicated(existing$time), ]
+    if (nrow(existing) == 0) {
+      return(as.Date(default_from))
+    }
+    min_t <- min(existing$time, na.rm = TRUE)
+    max_t <- max(existing$time, na.rm = TRUE)
+    if (by == "day") {
+      all <- seq(min_t, max_t, by = "day")
+    } else if (by == "week") {
+      all <- seq(min_t, max_t, by = "week")
+    } else if (by == "month") {
+      all <- seq(min_t, max_t, by = "month")
+    } else {
+      all <- seq(min_t, max_t, by = "day")
+    }
+    missing <- setdiff(all, existing$time)
+    if (length(missing) > 0) {
+      return(min(missing))
+    }
+    next_date <- if (by == "day") max_t + 1 else if (by == "week") max_t + 7 else as.Date(seq(max_t, length = 2, by = "month")[2])
+    return(next_date)
+  }
+
   message("Downloading keyword: ", keyword)
 
   safe_gtrends_windows <- function(expr, label) {
@@ -107,11 +139,9 @@ proc_keyword_latest <- function(keyword = "Insolvenz",
 
   message("Downloading daily data")
   existing_d <- safe_read_keyword("d")
-  if (!is.null(existing_d) && nrow(existing_d) > 0) {
-    daily_from <- max(as.Date(max(existing_d$time, na.rm = TRUE)) + 1, as.Date(from))
-  } else {
-    daily_from <- as.Date(from)
-  }
+  daily_from <- find_next_missing(existing_d, "day", from)
+  if (is.numeric(daily_from)) daily_from <- as.Date(daily_from, origin = "1970-01-01")
+  daily_from <- max(daily_from, as.Date(from))
   if (daily_from > today) {
     message(sprintf("  Daily already up to date: latest existing date is %s", daily_from - 1))
   } else {
@@ -137,10 +167,12 @@ proc_keyword_latest <- function(keyword = "Insolvenz",
 
   existing_w <- safe_read_keyword("w")
   if (!is.null(existing_w) && nrow(existing_w) > 0) {
-    weekly_from <- max(as.Date(max(existing_w$time, na.rm = TRUE)) + 7, as.Date(from))
+    weekly_from <- find_next_missing(existing_w, "week", from)
   } else {
     weekly_from <- as.Date(from)
   }
+  if (is.numeric(weekly_from)) weekly_from <- as.Date(weekly_from, origin = "1970-01-01")
+  weekly_from <- max(weekly_from, as.Date(from))
   if (weekly_from > today) {
     message(sprintf("  Weekly already up to date: latest existing date is %s", weekly_from - 7))
   } else {
@@ -166,10 +198,9 @@ proc_keyword_latest <- function(keyword = "Insolvenz",
 
   message("Downloading monthly data")
   existing_m <- safe_read_keyword("m")
-  monthly_from <- as.Date(max(as.Date(from), as.Date("2006-01-01")))
-  if (!is.null(existing_m) && nrow(existing_m) > 0) {
-    monthly_from <- max(monthly_from, as.Date(max(existing_m$time, na.rm = TRUE)) + 1)
-  }
+  monthly_from <- find_next_missing(existing_m, "month", from)
+  if (is.numeric(monthly_from)) monthly_from <- as.Date(monthly_from, origin = "1970-01-01")
+  monthly_from <- max(monthly_from, as.Date(from), as.Date("2006-01-01"))
   if (monthly_from > today) {
     message(sprintf("  Monthly already up to date: latest existing date is %s", monthly_from - 1))
   } else {
