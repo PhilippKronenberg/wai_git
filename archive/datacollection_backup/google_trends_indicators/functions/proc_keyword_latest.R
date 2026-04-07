@@ -26,13 +26,16 @@
 #'
 proc_keyword_latest <- function(keyword = "Insolvenz",
                                 geo = "CH",
-                                n_windows = 12,
+                                n_windows = 2,
                                 from = NULL) {
   today <- Sys.Date()
+  is_rate_limit_error <- function(msg) {
+    grepl("429|too many requests|rate limit|too soon|quota", msg, ignore.case = TRUE)
+  }
   
   # Read environment variables for rate-limiting
-  wait_val <- as.integer(Sys.getenv("WAI_WAIT", unset = "20"))
-  retry_val <- as.integer(Sys.getenv("WAI_RETRY", unset = "20"))
+  wait_val <- as.integer(Sys.getenv("WAI_WAIT", unset = "60"))
+  retry_val <- as.integer(Sys.getenv("WAI_RETRY", unset = "8"))
   
   # If from is not specified, start from the latest existing data
   if (is.null(from)) {
@@ -48,70 +51,188 @@ proc_keyword_latest <- function(keyword = "Insolvenz",
       message("No existing data found; using default 90-day window")
     }
   }
+  from_date <- as.Date(from)
+  stale_gap_days <- as.numeric(today - from_date)
+  if (is.na(stale_gap_days)) {
+    stale_gap_days <- 0
+  }
+  restart_from_raw <- function(suffix, step_days) {
+    tryCatch(
+      {
+        x <- read_keyword(keyword, geo, suffix) %>%
+          mutate(time = as.Date(time)) %>%
+          filter(!is.na(time)) %>%
+          distinct(time, .keep_all = TRUE) %>%
+          arrange(time)
+
+        if (nrow(x) == 0) {
+          return(list(start = from_date, has_internal_gap = FALSE))
+        }
+
+        gaps <- as.integer(diff(x$time))
+        gap_idx <- which(gaps > step_days)
+        if (length(gap_idx) > 0) {
+          list(
+            start = x$time[min(gap_idx)] + step_days,
+            has_internal_gap = TRUE
+          )
+        } else {
+          list(
+            start = max(x$time, na.rm = TRUE) + step_days,
+            has_internal_gap = FALSE
+          )
+        }
+      },
+      error = function(e) list(start = as.Date(NA), has_internal_gap = FALSE)
+    )
+  }
+  daily_restart <- restart_from_raw("d", 1)
+  weekly_restart <- restart_from_raw("w", 7)
+  daily_restart_from <- daily_restart$start
+  weekly_restart_from <- weekly_restart$start
 
   enhance_keyword <- function(data, keyword, geo, suffix){
-    old <- read_keyword(keyword, geo, suffix) %>%
-      mutate(n = as.integer(n))
+    old <- tryCatch(
+      read_keyword(keyword, geo, suffix) %>%
+        mutate(n = as.integer(n)),
+      error = function(e) NULL
+    )
     new <- aggregate_windows(data)
-    write_keyword(aggregate_averages(old, new), keyword, geo, suffix)
+    if (is.null(old) || nrow(old) == 0) {
+      write_keyword(new, keyword, geo, suffix)
+    } else {
+      write_keyword(aggregate_averages(old, new), keyword, geo, suffix)
+    }
+  }
+
+  safe_download <- function(label, code) {
+    tryCatch(
+      {
+        code
+        TRUE
+      },
+      error = function(e) {
+        err_msg <- conditionMessage(e)
+        if (is_rate_limit_error(err_msg)) {
+          message("  RATE LIMITED during ", label, ": ", err_msg)
+          return(FALSE)
+        }
+        stop(e)
+      }
+    )
   }
 
   message("Downloading keyword: ", keyword)
+  status <- c(hourly = FALSE, daily = FALSE, weekly = FALSE, monthly = FALSE)
 
   message("Downloading hourly data")
-  h <- ts_gtrends(
-    keyword = keyword,
-    geo = geo,
-    time = "now 7-d",
-    wait = wait_val,
-    retry = retry_val,
-  )
-  h <- h %>%
-    group_by(time) %>%
-    summarize(value = mean(value, na.rm=TRUE)) %>%
-    mutate(n = 1)
-  # NOTE: this data is intentionally not re-written on every update, not aggregated with the rest
-  write_keyword(h, keyword, geo, "h")
+  status["hourly"] <- safe_download("hourly", {
+    h <- ts_gtrends(
+      keyword = keyword,
+      geo = geo,
+      time = "now 7-d",
+      wait = wait_val,
+      retry = retry_val
+    )
+    h <- h %>%
+      group_by(time) %>%
+      summarize(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+      mutate(n = 1L)
+    # NOTE: this data is intentionally not re-written on every update, not aggregated with the rest
+    write_keyword(h, keyword, geo, "h")
+  })
 
   message("Downloading daily data")
-  # Use auto-detected from or fallback to 90 days
-  daily_from <- max(from, seq(today, length.out = 2, by = "-90 days")[2])
-  message(sprintf("  Daily: downloading from %s to %s", daily_from, today))
-  d <- ts_gtrends_windows(
-    keyword = keyword,
-    geo = geo,
-    from = daily_from,
-    stepsize = "1 day", windowsize = "3 months",
-    n_windows = n_windows, wait = wait_val, retry = retry_val,
-    prevent_window_shrinkage = FALSE
-  )
-  enhance_keyword(d, keyword, geo, "d")
+  if (stale_gap_days > 120) {
+    daily_from <- if (!is.na(daily_restart_from)) daily_restart_from else from_date
+    daily_stepsize <- "15 days"
+    daily_windowsize <- "6 months"
+    daily_n_windows <- max(n_windows, ceiling(as.numeric(today - daily_from) / 15))
+  } else {
+    daily_from <- max(
+      if (!is.na(daily_restart_from)) daily_restart_from else from_date,
+      seq(today, length.out = 2, by = "-90 days")[2]
+    )
+    daily_stepsize <- "1 day"
+    daily_windowsize <- "3 months"
+    daily_n_windows <- n_windows
+  }
+  message(sprintf(
+    "  Daily: downloading from %s to %s using stepsize=%s windowsize=%s (%s windows)",
+    daily_from, today, daily_stepsize, daily_windowsize, daily_n_windows
+  ))
+  if (daily_from >= today) {
+    message("  Daily archive already covers today; skipping download")
+    status["daily"] <- TRUE
+  } else {
+    status["daily"] <- safe_download("daily", {
+      d <- ts_gtrends_windows(
+        keyword = keyword,
+        geo = geo,
+        from = daily_from,
+        stepsize = daily_stepsize, windowsize = daily_windowsize,
+        n_windows = daily_n_windows, wait = wait_val, retry = retry_val,
+        prevent_window_shrinkage = stale_gap_days > 120
+      )
+      enhance_keyword(d, keyword, geo, "d")
+    })
+  }
 
   message("Downloading weekly data")
-  # Use auto-detected from or fallback to 1 year
-  weekly_from <- max(from, seq(today, length.out = 2, by = "-1 year")[2])
-  message(sprintf("  Weekly: downloading from %s to %s", weekly_from, today))
-  w <- ts_gtrends_windows(
-    keyword = keyword,
-    geo = geo,
-    from = weekly_from,
-    stepsize = "1 week", windowsize = "1 year",
-    n_windows = n_windows, wait = wait_val, retry = retry_val,
-    prevent_window_shrinkage = FALSE
-  )
-  enhance_keyword(w, keyword, geo, "w")
+  if (stale_gap_days > 370) {
+    weekly_from <- if (!is.na(weekly_restart_from)) weekly_restart_from else from_date
+    weekly_stepsize <- "11 weeks"
+    weekly_windowsize <- "5 years"
+    weekly_n_windows <- max(n_windows, ceiling(as.numeric(today - weekly_from) / (11 * 7)))
+  } else {
+    weekly_from <- max(
+      if (!is.na(weekly_restart_from)) weekly_restart_from else from_date,
+      seq(today, length.out = 2, by = "-1 year")[2]
+    )
+    weekly_stepsize <- "1 week"
+    weekly_windowsize <- "1 year"
+    weekly_n_windows <- n_windows
+  }
+  message(sprintf(
+    "  Weekly: downloading from %s to %s using stepsize=%s windowsize=%s",
+    weekly_from, today, weekly_stepsize, weekly_windowsize
+  ))
+  if (weekly_from >= today) {
+    message("  Weekly archive already covers today; skipping download")
+    status["weekly"] <- TRUE
+  } else {
+    status["weekly"] <- safe_download("weekly", {
+      w <- ts_gtrends_windows(
+        keyword = keyword,
+        geo = geo,
+        from = weekly_from,
+        stepsize = weekly_stepsize, windowsize = weekly_windowsize,
+        n_windows = weekly_n_windows, wait = wait_val, retry = retry_val,
+        prevent_window_shrinkage = stale_gap_days > 370
+      )
+      enhance_keyword(w, keyword, geo, "w")
+    })
+  }
 
   message("Downloading monthly data")
-  # For monthly, use auto-detected from but not earlier than 2006
-  monthly_from <- as.character(max(as.Date(from), as.Date("2006-01-01")))
-  message(sprintf("  Monthly: downloading from %s to %s", monthly_from, today))
-  m <- ts_gtrends_windows(
-    keyword = keyword,
-    geo = geo,
-    from = monthly_from,
-    stepsize = "1 month", windowsize = "20 years",
-    n_windows = n_windows, wait = wait_val, retry = retry_val,
-    prevent_window_shrinkage = FALSE
+  # Keep the full-history monthly anchor so Google returns a lower-frequency series.
+  monthly_from <- "2006-01-01"
+  monthly_n_windows <- max(
+    n_windows,
+    ceiling(as.numeric(today - as.Date(monthly_from)) / (15 * 365) * 12)
   )
-  enhance_keyword(m, keyword, geo, "m")
+  message(sprintf("  Monthly: downloading from %s to %s", monthly_from, today))
+  status["monthly"] <- safe_download("monthly", {
+    m <- ts_gtrends_windows(
+      keyword = keyword,
+      geo = geo,
+      from = monthly_from,
+      stepsize = "1 month", windowsize = "15 years",
+      n_windows = monthly_n_windows, wait = wait_val, retry = retry_val,
+      prevent_window_shrinkage = FALSE
+    )
+    enhance_keyword(m, keyword, geo, "m")
+  })
+
+  invisible(status)
 }

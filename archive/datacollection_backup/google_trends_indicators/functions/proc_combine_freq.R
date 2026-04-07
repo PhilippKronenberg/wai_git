@@ -5,7 +5,10 @@ proc_combine_freq <- function(keyword = "Insolvenz", geo = "ch") {
   h <- select(read_keyword(keyword, geo, "h"), -n)
   d <- select(read_keyword(keyword, geo, "d"), -n)
   w <- select(read_keyword(keyword, geo, "w"), -n)
-  m <- select(read_keyword(keyword, geo, "m"), -n)
+  m <- select(read_keyword(keyword, geo, "m"), -n) %>%
+    mutate(time = as.Date(format(as.Date(time), "%Y-%m-01"))) %>%
+    group_by(time) %>%
+    summarize(value = mean(value), .groups = "drop")
 
 
   # extend daily data with hourly data

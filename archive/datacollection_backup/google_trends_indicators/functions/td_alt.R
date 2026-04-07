@@ -249,6 +249,17 @@ td_alt <- function(formula, conversion = "sum", to = "quarterly",
                method = "chow-lin-maxlog", truncated.rho = 0, fixed.rho = 0.5,
                criterion = "proportional", h = 1,
                start = NULL, end = NULL, ...) {
+  infer_lf_end_tsbox <- function(lf_times, lf_diff, hf_diff) {
+    normalize_by <- function(x) {
+      x <- gsub("daily$", "day", x)
+      gsub("ly$", "", x)
+    }
+
+    lf_by <- normalize_by(as.character(lf_diff))
+    hf_by <- paste0("-", normalize_by(as.character(hf_diff)))
+    next_lf <- seq.Date(tail(lf_times, 1), length.out = 2, by = lf_by)[2]
+    seq.Date(next_lf, length.out = 2, by = hf_by)[2]
+  }
   
   # td deals with the formula interface, the time-series properties
   # and allows for optional shortening of the series. The estimation itself is
@@ -384,8 +395,8 @@ td_alt <- function(formula, conversion = "sum", to = "quarterly",
       
       # last time stamp covered by lf, in hf units. This could be indered from hf
       # and lf only.
-      hf.by.string <- paste0("-", if (!grepl("^\\d", to)) "1 ", to)
-      lf.end <- tsbox::ts_lag(tail(tsbox::ts_bind(lf.dt, NA), 1), by = hf.by.string)$time
+      lf_smry <- tsbox::ts_summary(lf.dt)
+      lf.end <- infer_lf_end_tsbox(lf, lf_smry$diff[1], to)
       
       # data matrices
       hf.env <- list2env(as.list(X.matrices))
@@ -398,8 +409,8 @@ td_alt <- function(formula, conversion = "sum", to = "quarterly",
       # if there is no X Variables, set it to a constant ('Denton' Methods)
       to <- gsub("daily$", "day", to)
       to <- gsub("ly$", "", to)
-      hf.by.string <- paste0("-", if (!grepl("^\\d", to)) "1 ", to)
-      lf.end <- tsbox::ts_lag(tail(tsbox::ts_bind(lf.dt, NA), 1), by = hf.by.string)$time
+      lf_smry <- tsbox::ts_summary(lf.dt)
+      lf.end <- infer_lf_end_tsbox(lf, lf_smry$diff[1], to)
       hf.dt <- tsbox::ts_dts(data.frame(time = seq(lf[1], lf.end, by = to), value = 1))
       X.template <- tsbox::copy_class(hf.dt, y_l.series)
       X <- as.matrix(hf.dt$value)

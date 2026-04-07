@@ -12,15 +12,18 @@ cat("\014")
 # Configuration ---------------------------------------------------------------
 # Set these via environment variables to override:
 # WAI_USE_CACHE: if TRUE or unset, falls back to cached CSVs when downloads fail
-# WAI_WAIT: seconds to wait between retries (default 120)
-# WAI_RETRY: number of retry attempts (default 60)
+# WAI_WAIT: base seconds to wait between retries (default 90)
+# WAI_RETRY: number of retry attempts (default 8)
+# WAI_KEYWORD_PAUSE: seconds to sleep between keywords (default 45)
+# WAI_WINDOWS: overlapping windows per frequency (default 2)
+# WAI_STOP_AFTER_RATE_LIMIT: if TRUE, stop after the first rate limit (default TRUE)
 # WAI_PROXY: HTTP proxy URL (e.g., "http://proxy.example.com:8080")
 #     Use this when your IP is blocked by Google Trends.
 #     Example: WAI_PROXY="http://proxy.example.com:8080" Rscript hfi_googletrends_Arbeitsmarkt_DOWNLOAD.R
+setwd("C:/Users/kphilipp/GitHub/wai_git/archive/datacollection_backup/google_trends_indicators/functions")
 
-setwd("/workspaces/wai_git/archive/datacollection_backup/google_trends_indicators/functions")
-lapply(list.files(pattern = "[.]R$", recursive = TRUE), source)
-
+#setwd("/workspaces/wai_git/archive/datacollection_backup/google_trends_indicators/functions")
+invisible(lapply(list.files(pattern = "[.]R$", recursive = TRUE), source))
 library(zoo)
 library(tempdisagg)
 library(forecast)
@@ -39,7 +42,8 @@ library(gtrendsR)
 library(readr)
 library(tidyr)
 
-setwd("/workspaces/wai_git/archive/datacollection_backup/google_trends_indicators")
+#setwd("/workspaces/wai_git/archive/datacollection_backup/google_trends_indicators")
+setwd("C:/Users/kphilipp/GitHub/wai_git/archive/datacollection_backup/google_trends_indicators")
 
 # Keywords ------------------------------------------------------------------
 keywords <- c(
@@ -53,33 +57,68 @@ keywords <- c(
 env_val <- Sys.getenv("WAI_USE_CACHE", unset = "TRUE")
 use_cache <- tolower(env_val) %in% c("1", "true", "t", "yes", "y")
 
-wait_val <- as.integer(Sys.getenv("WAI_WAIT", unset = "120"))
-retry_val <- as.integer(Sys.getenv("WAI_RETRY", unset = "60"))
+wait_val <- as.integer(Sys.getenv("WAI_WAIT", unset = "90"))
+retry_val <- as.integer(Sys.getenv("WAI_RETRY", unset = "8"))
+pause_val <- as.integer(Sys.getenv("WAI_KEYWORD_PAUSE", unset = "45"))
+n_windows <- as.integer(Sys.getenv("WAI_WINDOWS", unset = "2"))
+stop_after_rl <- tolower(Sys.getenv("WAI_STOP_AFTER_RATE_LIMIT", unset = "TRUE")) %in%
+  c("1", "true", "t", "yes", "y")
 
-message(sprintf("[CONFIG] USE_CACHE=%s, WAIT=%s, RETRY=%s", use_cache, wait_val, retry_val))
+message(sprintf(
+  "[CONFIG] USE_CACHE=%s, WAIT=%s, RETRY=%s, KEYWORD_PAUSE=%s, WINDOWS=%s, STOP_AFTER_RATE_LIMIT=%s",
+  use_cache, wait_val, retry_val, pause_val, n_windows, stop_after_rl
+))
 
-# Download function with graceful fallback ----------------------------------
-safe_proc_keyword_latest <- function(keyword, geo = "CH", fallback_to_cache = TRUE) {
-  tryCatch({
-    message(sprintf("  Attempting to download: %s", keyword))
-    proc_keyword_latest(keyword = keyword, geo = geo)
-    message(sprintf("  SUCCESS: %s", keyword))
-    return(TRUE)
-  }, error = function(e) {
-    err_msg <- as.character(e)
-    if (grepl("429|rate limit|too soon", err_msg, ignore.case = TRUE)) {
-      message(sprintf("  RATE LIMITED (429): %s", keyword))
-      message("     -> Use cached data instead")
-      if (fallback_to_cache) {
-        return(FALSE)  # signal that we used cache
-      } else {
-        stop(e)  # re-throw if cache not allowed
+is_rate_limit_error <- function(msg) {
+  grepl("429|too many requests|rate limit|too soon|quota", msg, ignore.case = TRUE)
+}
+
+read_latest_time <- function(keyword, geo = "CH", suffix = "sa") {
+  existing <- tryCatch(
+    suppressWarnings(read_keyword(keyword, geo, suffix)),
+    error = function(e) NULL
+  )
+  if (is.null(existing) || nrow(existing) == 0 || !"time" %in% names(existing)) {
+    return(as.Date(NA))
+  }
+  max(as.Date(existing$time), na.rm = TRUE)
+}
+
+update_keyword <- function(keyword, geo = "CH") {
+  before <- read_latest_time(keyword, geo, "sa")
+  status <- tryCatch(
+    proc_keyword_latest(keyword = keyword, geo = geo, n_windows = n_windows),
+    error = function(e) {
+      err_msg <- conditionMessage(e)
+      if (is_rate_limit_error(err_msg) && use_cache) {
+        message(sprintf("  RATE LIMITED while updating %s", keyword))
+        return(structure(FALSE, rate_limited = TRUE))
       }
-    } else {
-      message(sprintf("  ERROR: %s", err_msg))
       stop(e)
     }
-  })
+  )
+
+  if (isFALSE(status)) {
+    return(list(
+      keyword = keyword,
+      before = before,
+      after = before,
+      updated = FALSE,
+      rate_limited = isTRUE(attr(status, "rate_limited"))
+    ))
+  }
+
+  proc_combine_freq(keyword = keyword, geo = geo)
+  proc_seas_adj(keyword = keyword, geo = geo)
+  after <- read_latest_time(keyword, geo, "sa")
+
+  list(
+    keyword = keyword,
+    before = before,
+    after = after,
+    updated = !is.na(after) && !identical(before, after),
+    rate_limited = any(!unlist(status))
+  )
 }
 
 # Attempt updates for each keyword ------------------------------------------
@@ -91,15 +130,8 @@ message("")
 # First, detect which dates to download for each keyword
 message("Auto-detecting latest date in each keyword's archive:")
 for (kw in keywords) {
-  existing <- tryCatch(
-    {suppressWarnings(readr::read_csv(
-      file.path("raw/ch", paste0(kw, "_sa.csv")),
-      col_types = readr::cols()
-    ))},
-    error = function(e) NULL
-  )
-  if (!is.null(existing) && nrow(existing) > 0) {
-    max_date <- max(existing$time, na.rm = TRUE)
+  max_date <- read_latest_time(kw, "CH", "sa")
+  if (!is.na(max_date)) {
     message(sprintf("  %s: latest = %s (will download from %s)", 
                     substr(kw, 1, 40), max_date, as.Date(max_date) + 1))
   } else {
@@ -120,10 +152,20 @@ message("Starting downloads...")
 message("")
 
 all_downloaded <- TRUE
+results <- vector("list", length(keywords))
 for (kw in keywords) {
-  success <- safe_proc_keyword_latest(kw, fallback_to_cache = use_cache)
-  if (isFALSE(success)) {
+  result <- update_keyword(kw, geo = "CH")
+  results[[which(keywords == kw)[1]]] <- result
+  if (isTRUE(result$rate_limited)) {
     all_downloaded <- FALSE
+    if (isTRUE(stop_after_rl)) {
+      message("Stopping after the first rate limit to avoid extending the block.")
+      break
+    }
+  }
+  if (!identical(kw, tail(keywords, 1)) && pause_val > 0) {
+    message(sprintf("Cooling down for %s seconds before the next keyword...", pause_val))
+    Sys.sleep(pause_val)
   }
 }
 
@@ -147,6 +189,19 @@ if (all_downloaded) {
   message("")
 }
 
+message("")
+message("Keyword update summary:")
+for (result in results[!vapply(results, is.null, logical(1))]) {
+  message(sprintf(
+    "  %s | before=%s | after=%s | updated=%s | rate_limited=%s",
+    result$keyword,
+    ifelse(is.na(result$before), "NA", as.character(result$before)),
+    ifelse(is.na(result$after), "NA", as.character(result$after)),
+    result$updated,
+    result$rate_limited
+  ))
+}
+
 # Read keywords and create indicator ----------------------------------------
 message("")
 message(paste0(rep("=", 70), collapse = ""))
@@ -155,7 +210,7 @@ message(paste0(rep("=", 70), collapse = ""))
 message("")
 
 # Read keyword data (cached or newly downloaded)
-data <- read_keywords(keywords, suffix = "sa", id = "seas_adj")
+data <- read_keywords(keywords, suffix = "sa", id = "detrended_seas_adj")
 
 smry <- ts_summary(data)
 if (nrow(dplyr::distinct(smry, start, end)) != 1) {
@@ -186,5 +241,5 @@ message("")
 message(paste0(rep("=", 70), collapse = ""))
 message("✓ COMPLETE")
 message(paste0(rep("=", 70), collapse = ""))
-message(sprintf("Output written to: data/ch/Arbeitsmarkt_sa.csv"))
+message(sprintf("Output written to: raw/ch/Arbeitsmarkt_sa.csv"))
 message("")

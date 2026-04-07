@@ -13,6 +13,9 @@ gtrends_with_backoff <- function(keyword = NA,
                                  quiet = FALSE,
                                  attempt = 1,
                                  use_proxy = NULL) {
+  is_rate_limit_error <- function(msg) {
+    grepl("429|too many requests|rate limit|too soon|quota", msg, ignore.case = TRUE)
+  }
   
   # Configure proxy if requested or set via environment variable
   if (attempt == 1) {
@@ -52,17 +55,20 @@ gtrends_with_backoff <- function(keyword = NA,
       tz = tz, onlyInterest = onlyInterest
     ),
     error = function(e) {
-      if (grepl("== 200", e)) {
+      err_msg <- conditionMessage(e)
+      if (grepl("No data returned by the query", err_msg, fixed = TRUE)) {
+        msg("No data returned for this window; continuing with an empty result.")
+        return(list(interest_over_time = NULL))
+      }
+      if (grepl("== 200", err_msg, fixed = TRUE) || is_rate_limit_error(err_msg)) {
         if (attempt == 1) {
-          msg("Oh noes, they don't like us anymore...")
+          msg("Google Trends rejected the request, backing off...")
         } else {
-          msg("Nope, still nothing...")
+          msg("Still blocked by Google Trends...")
         }
 
-        t <- attempt * wait
-
-        # Exponential backoff. Neat but not really suitable here.
-        # t <- wait*ceiling(runif(1)*(2^attempt-1))
+        jitter <- stats::runif(1, min = 0, max = max(wait, 1))
+        t <- ceiling(wait * (2 ^ (attempt - 1)) + jitter)
 
         msg("Waiting for ", t, " seconds")
         Sys.sleep(t)

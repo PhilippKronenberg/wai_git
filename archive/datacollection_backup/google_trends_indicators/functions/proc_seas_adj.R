@@ -34,7 +34,10 @@ proc_seas_adj <- function(keyword = "Insolvenz", geo = "ch") {
     transmute(time = as.Date(ds), trend, seas_comp = additive_terms) %>% # additive_terms = yhat - trend,
     left_join(data, by = "time") %>%
     rename(orig = value) %>%
-    mutate(seas_adj = orig - seas_comp) %>%
+    mutate(
+      seas_adj = orig - seas_comp,
+      detrended_seas_adj = orig - seas_comp - trend
+    ) %>%
     ts_long()
 
   write_keyword(sa, keyword, geo, "sa")
